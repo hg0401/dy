@@ -25,4 +25,8 @@ mitmproxy-ca-cert.p12这个
 下一步 -> 完成。
 
 
+*****************
+运行addon.py
+然后谷歌浏览器搜索live.douyin.com
+随便进一个直播间控制台就有了
 
