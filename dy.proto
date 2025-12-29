@@ -1,0 +1,124 @@
+syntax = "proto3";
+package douyin;
+
+// 1. 最外层包装：WebSocket 推送帧
+message PushFrame {
+  uint64 seqId = 1;
+  uint64 logId = 2;
+  uint64 service = 3;
+  uint64 method = 4;
+  repeated HeadersList headersList = 5;
+  string payloadEncoding = 6; // 通常是 'gzip'
+  string payloadType = 7;
+  bytes payload = 8; // 这里面是压缩后的 Response
+}
+
+message HeadersList {
+  string key = 1;
+  string value = 2;
+}
+
+// 2. 解压 payload 后得到的响应体
+message Response {
+  repeated Message messagesList = 1; // 消息列表
+  string cursor = 2;
+  uint64 fetchInterval = 3;
+  uint64 now = 4;
+  string internalExt = 5;
+  uint32 fetchType = 6;
+  map<string, string> routeParams = 7;
+  uint64 heartbeatDuration = 8;
+  bool needAck = 9;
+  string pushServer = 10;
+  string liveCursor = 11;
+  bool historyNoMore = 12;
+}
+
+// 3. 单条消息结构
+message Message {
+  string method = 1; // 核心字段，例如 "WebcastChatMessage"
+  bytes payload = 2; // 这里面是具体消息（弹幕/礼物）的二进制
+  int64 msgId = 3;
+  int32 msgType = 4;
+  int64 offset = 5;
+}
+
+// --- 下面是具体业务消息，字段ID非常容易变，需要定期校对 ---
+
+// 4. 聊天消息 (WebcastChatMessage)
+message ChatMessage {
+  Common common = 1;
+  User user = 2;      // 发言用户
+  string content = 3; // 弹幕内容
+  bool visibleToSender = 4;
+  Image backgroundImage = 5;
+  string fullScreenTextColor = 6;
+  Image backgroundImageV2 = 7;
+  PublicAreaCommon publicAreaCommon = 9;
+  Image giftImage = 10;
+}
+
+// 5. 礼物消息 (WebcastGiftMessage)
+message GiftMessage {
+  Common common = 1;
+  uint64 giftId = 2;
+  uint64 fanTicketCount = 3;
+  uint64 groupCount = 4;
+  uint64 repeatCount = 5;
+  uint64 comboCount = 6;
+  User user = 7;       // 送礼人
+  User toUser = 8;     // 主播
+  uint64 repeatEnd = 9;
+  TextEffect textEffect = 10;
+  uint64 groupId = 11;
+  uint64 incomeTaskgifts = 12;
+  uint64 roomFanTicketCount = 13;
+  GiftStruct gift = 15; // 礼物详情
+}
+
+// 辅助结构：用户信息
+message User {
+  uint64 id = 1;
+  uint64 shortId = 2;
+  string nickName = 3; // 昵称
+  uint32 gender = 4;
+  string signature = 5;
+  uint32 level = 6;
+  uint64 birthday = 7;
+  string telephone = 8;
+  Image avatarThumb = 9;
+  Image avatarMedium = 10;
+  Image avatarLarge = 11;
+}
+
+message Common {
+  string method = 1;
+  uint64 msgId = 2;
+  uint64 roomId = 3;
+  uint64 createTime = 4;
+}
+
+message GiftStruct {
+  Image image = 1;
+  string describe = 2;
+  uint64 notify = 3;
+  uint64 duration = 4;
+  uint64 id = 5;
+  string name = 16; // 礼物名称
+}
+
+message Image {
+  repeated string urlList = 1;
+  string uri = 2;
+}
+
+message PublicAreaCommon {
+  Image userLabel = 1;
+  uint64 userConsumeInRoom = 2;
+  uint64 userSendGiftSize = 3;
+}
+
+message TextEffect {
+  Image portrait = 1;
+  Image landscape = 2;
+}
