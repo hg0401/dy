@@ -3,12 +3,56 @@ import json
 import subprocess
 import datetime
 import os
+import winreg  # 操作注册表
+import ctypes  # 调用系统API刷新设置
+import atexit  # 退出时清理
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
                              QPushButton, QGroupBox, QCheckBox, QTextEdit, QLabel,
                              QHeaderView, QLineEdit)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
+
+
+# ==========================================
+# 0. 系统代理管理器 (核心新增组件)
+# ==========================================
+class SystemProxy:
+    INTERNET_SETTINGS = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                       r'Software\Microsoft\Windows\CurrentVersion\Internet Settings',
+                                       0, winreg.KEY_ALL_ACCESS)
+
+    def set_proxy(self, ip, port):
+        """开启系统代理"""
+        try:
+            proxy_addr = f"{ip}:{port}"
+            # 1. 开启代理 (ProxyEnable = 1)
+            winreg.SetValueEx(self.INTERNET_SETTINGS, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
+            # 2. 设置地址 (ProxyServer = 127.0.0.1:8081)
+            winreg.SetValueEx(self.INTERNET_SETTINGS, 'ProxyServer', 0, winreg.REG_SZ, proxy_addr)
+            # 3. 刷新系统设置，使其立即生效
+            self.refresh_system()
+            print(f">>> 系统代理已自动开启: {proxy_addr}")
+        except Exception as e:
+            print(f"❌ 设置代理失败: {e}")
+
+    def unset_proxy(self):
+        """关闭系统代理"""
+        try:
+            # 1. 关闭代理 (ProxyEnable = 0)
+            winreg.SetValueEx(self.INTERNET_SETTINGS, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
+            # 2. 刷新系统设置
+            self.refresh_system()
+            print(">>> 系统代理已自动关闭，恢复直连")
+        except Exception as e:
+            print(f"❌ 关闭代理失败: {e}")
+
+    def refresh_system(self):
+        """通知 Windows 设置已改变，必须执行这一步，否则注册表改了也不生效"""
+        INTERNET_OPTION_SETTINGS_CHANGED = 39
+        INTERNET_OPTION_REFRESH = 37
+        ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+        ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
 
 
 # ==========================================
@@ -32,9 +76,8 @@ class CaptureWorker(QThread):
             return
 
         try:
-            # 端口已经在 addon_backend.py 里写死为 8081
+            # 端口固定 8081
             cmd = [python_exe, script_path]
-
             self.process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -44,7 +87,7 @@ class CaptureWorker(QThread):
                 bufsize=1,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
             )
-            self.log_signal.emit('sys', '>>> 抓包服务已启动 (Port: 8081)，等待数据...')
+            self.log_signal.emit('sys', '>>> 抓包服务已启动 (Port: 8081)...')
         except Exception as e:
             self.log_signal.emit('sys', f"❌ 启动失败: {str(e)}")
             return
@@ -79,7 +122,7 @@ class CaptureWorker(QThread):
 
 
 # ==========================================
-# 2. 自定义控件：主播详情卡片
+# 2. 自定义控件
 # ==========================================
 class AnchorInfoCard(QGroupBox):
     def __init__(self):
@@ -114,13 +157,12 @@ class AnchorInfoCard(QGroupBox):
 
 
 # ==========================================
-# 3. 主界面 (语法修复版)
+# 3. 主界面
 # ==========================================
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("抖音直播监控中控台 - 终极稳定版")
+        self.setWindowTitle("抖音直播监控中控台 - 自动代理版")
         self.resize(1300, 850)
 
         self.setStyleSheet("""
@@ -133,13 +175,16 @@ class MainWindow(QMainWindow):
             QHeaderView::section { background-color: #f8f9fa; border: none; padding: 6px; font-weight: bold; color: #555; }
         """)
 
+        # --- 自动设置系统代理 ---
+        self.proxy_manager = SystemProxy()
+        self.proxy_manager.set_proxy("127.0.0.1", "8081")
+
         self.text_log = QTextEdit()
         self.text_log.setReadOnly(True)
         self.text_log.document().setMaximumBlockCount(500)
 
         self.room_map = {}
         self.pending_browsers = {}
-        # 【新增】黑名单：被移除的房间ID，本场运行不再自动添加
         self.blacklisted_rooms = set()
         self.filters = {'sys': True, 'gift': True, 'chat': True}
 
@@ -164,7 +209,7 @@ class MainWindow(QMainWindow):
         input_layout.addWidget(self.btn_add)
         table_layout.addLayout(input_layout)
 
-        self.table_rooms = QTableWidget(0, 9)  # 增加一列给刷新按钮
+        self.table_rooms = QTableWidget(0, 9)
         cols = ["序号", "主播/房间", "标题/ID", "消息数", "开播", "监控", "状态", "操作", "工具"]
         self.table_rooms.setHorizontalHeaderLabels(cols)
         self.table_rooms.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
@@ -241,20 +286,43 @@ class MainWindow(QMainWindow):
             r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
         ]
         for path in candidates:
-            if os.path.exists(path): browser_path = path; break
+            if os.path.exists(path):
+                browser_path = path
+                break
+
         if not browser_path: return None
 
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        # 增加 --incognito (无痕模式) 减少缓存干扰
-        cmd = [browser_path, "--proxy-server=http://127.0.0.1:8081", f"--user-agent={user_agent}",
-               "--autoplay-policy=no-user-gesture-required", "--disable-quic", "--ignore-certificate-errors",
-               "--no-first-run", "--no-sandbox", "--disable-gpu", "--mute-audio", "--incognito", url]
+
+        cmd = [
+            browser_path,
+            "--proxy-server=http://127.0.0.1:8081",
+            f"--user-agent={user_agent}",
+
+            # === 核心去自动化特征参数 ===
+            "--disable-blink-features=AutomationControlled",  # <--- 关键！防止被识别为机器人
+            "--exclude-switches=enable-automation",
+
+            # === 性能参数 ===
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-quic",
+            "--ignore-certificate-errors",
+            "--no-first-run",
+            "--no-sandbox",
+            "--mute-audio",
+
+            # 开启 GPU 加速 (解决卡顿)
+            "--enable-gpu-rasterization",
+            "--ignore-gpu-blocklist",
+
+            url
+        ]
+
         try:
             return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.PIPE)
         except:
             return None
 
-    # --- 添加房间 ---
     def add_room_from_url(self):
         url = self.url_input.text().strip()
         if not url: return
@@ -267,11 +335,9 @@ class MainWindow(QMainWindow):
 
         self.table_rooms.setItem(row, 0, QTableWidgetItem(str(row + 1)))
         self.table_rooms.setItem(row, 1, QTableWidgetItem(user))
-
         display_text = url if url else f"ID:{room_id}"
         if is_external: display_text = f"外部ID:{room_id}"
         self.table_rooms.setItem(row, 2, QTableWidgetItem(display_text))
-
         self.table_rooms.setItem(row, 3, QTableWidgetItem("0"))
         self.table_rooms.setItem(row, 4, QTableWidgetItem("🕒"))
 
@@ -286,7 +352,6 @@ class MainWindow(QMainWindow):
 
         self.table_rooms.setItem(row, 6, QTableWidgetItem("未运行"))
 
-        # 启动/移除 按钮
         btn = QPushButton("启动" if not is_external else "移除")
         btn.setStyleSheet(
             "background-color: #568668; font-size: 11px;" if not is_external else "background-color: #6c757d;")
@@ -296,11 +361,10 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _, b=btn: self.remove_room(b, room_id))
         self.table_rooms.setCellWidget(row, 7, btn)
 
-        # 刷新按钮 (Fix ID issue)
         btn_refresh = QPushButton("刷新")
         btn_refresh.setStyleSheet("background-color: #17a2b8; font-size: 11px;")
         if is_external:
-            btn_refresh.setEnabled(False)  # 外部浏览器没法控制刷新
+            btn_refresh.setEnabled(False)
         else:
             btn_refresh.clicked.connect(lambda _, r=row: self.refresh_browser(r))
         self.table_rooms.setCellWidget(row, 8, btn_refresh)
@@ -317,7 +381,6 @@ class MainWindow(QMainWindow):
                 self.table_rooms.setItem(row, 6, QTableWidgetItem("运行中"))
                 self.table_rooms.item(row, 6).setForeground(QColor("green"))
         else:
-            # 关闭逻辑
             self.kill_browser(row)
             btn.setText("启动");
             btn.setStyleSheet("background-color: #568668;")
@@ -326,7 +389,6 @@ class MainWindow(QMainWindow):
             self.table_rooms.setItem(row, 1, QTableWidgetItem("待连接"))
 
     def kill_browser(self, row):
-        # 1. Kill from pending
         if row in self.pending_browsers:
             try:
                 subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.pending_browsers[row].pid)])
@@ -334,7 +396,6 @@ class MainWindow(QMainWindow):
                 pass
             del self.pending_browsers[row]
 
-        # 2. Kill from room_map
         target_id = None
         for r_id, info in self.room_map.items():
             if info['row'] == row:
@@ -350,14 +411,9 @@ class MainWindow(QMainWindow):
     def remove_room(self, btn, room_id):
         row = self.table_rooms.indexAt(btn.pos()).row()
         if row == -1: return
-
-        # 加入黑名单，防止复活
         if room_id: self.blacklisted_rooms.add(room_id)
-
         self.kill_browser(row)
         self.table_rooms.removeRow(row)
-
-        # 重排索引
         for r_id in self.room_map:
             if self.room_map[r_id]['row'] > row: self.room_map[r_id]['row'] -= 1
         new_pending = {}
@@ -367,12 +423,10 @@ class MainWindow(QMainWindow):
             elif r < row:
                 new_pending[r] = proc
         self.pending_browsers = new_pending
-
         for i in range(self.table_rooms.rowCount()):
             self.table_rooms.setItem(i, 0, QTableWidgetItem(str(i + 1)))
 
     def clear_rooms(self):
-        # 杀掉所有
         for proc in self.pending_browsers.values():
             try:
                 subprocess.call(['taskkill', '/F', '/T', '/PID', str(proc.pid)])
@@ -384,29 +438,21 @@ class MainWindow(QMainWindow):
                     subprocess.call(['taskkill', '/F', '/T', '/PID', str(info['browser_proc'].pid)])
                 except:
                     pass
-            # 将清理掉的房间加入黑名单
             self.blacklisted_rooms.add(r_id)
-
         self.pending_browsers.clear()
         self.room_map.clear()
         self.table_rooms.setRowCount(0)
 
-    # --- 核心：刷新页面以获取 ID ---
     def refresh_browser(self, row):
-        # 找到对应的 URL
         url_item = self.table_rooms.item(row, 2)
         if not url_item: return
         url = url_item.text()
-        if "http" not in url: return  # 已经是ID了，无法刷新
-
-        # 简单粗暴：重启浏览器
+        if "http" not in url: return
         self.kill_browser(row)
         proc = self.open_headless_browser(url)
         if proc:
             self.pending_browsers[row] = proc
-            # 状态重置
             self.table_rooms.setItem(row, 6, QTableWidgetItem("刷新中..."))
-            self.handle_log('sys', f"正在刷新第 {row + 1} 行的浏览器...")
 
     def handle_log(self, type, text):
         if self.filters.get(type, True): self.text_log.append(text)
@@ -415,11 +461,8 @@ class MainWindow(QMainWindow):
         room_id = data.get('room_id', 'UNKNOWN')
         msg_type = data.get('type')
         if room_id == 'UNKNOWN': return
-
-        # 【核心修复】黑名单检查
         if room_id in self.blacklisted_rooms: return
 
-        # === 1. 自动发现 ===
         if room_id not in self.room_map:
             matched_row = -1
             if self.pending_browsers:
@@ -427,29 +470,22 @@ class MainWindow(QMainWindow):
                 proc = self.pending_browsers[matched_row]
                 del self.pending_browsers[matched_row]
                 self.room_map[room_id] = {'row': matched_row, 'browser_proc': proc}
-
                 self.table_rooms.setItem(matched_row, 2, QTableWidgetItem(f"ID:{room_id}"))
                 self.table_rooms.setItem(matched_row, 1, QTableWidgetItem(data.get('user', '获取中...')))
                 self.table_rooms.setItem(matched_row, 4, QTableWidgetItem("✅"))
             else:
-                # 外部源
                 self.add_table_row(user=data.get('user', '获取中...'), room_id=room_id, is_external=True)
                 row = self.table_rooms.rowCount() - 1
                 self.room_map[room_id] = {'row': row, 'browser_proc': None}
 
-        # === 2. 更新数据 ===
         if room_id in self.room_map:
             row = self.room_map[room_id]['row']
-
-            # 主播信息更新
             if msg_type == 'anchor_info':
                 self.table_rooms.setItem(row, 1, QTableWidgetItem(data.get('user')))
                 douyin_id = data.get('douyin_id', '')
-                if douyin_id:
-                    self.table_rooms.setItem(row, 2, QTableWidgetItem(f"{douyin_id}"))
+                if douyin_id: self.table_rooms.setItem(row, 2, QTableWidgetItem(f"{douyin_id}"))
                 self.card_info.lbl_name.setText(data.get('user'))
                 self.card_info.lbl_id.setText(f"抖音号: {douyin_id}")
-
             elif "获取中" in self.table_rooms.item(row, 1).text() and data.get('user'):
                 self.table_rooms.setItem(row, 1, QTableWidgetItem(f"<{data.get('user')}>"))
 
@@ -460,15 +496,12 @@ class MainWindow(QMainWindow):
 
             if msg_type in ['chat', 'gift']:
                 cnt_item = self.table_rooms.item(row, 3)
-                if cnt_item:
-                    self.table_rooms.setItem(row, 3, QTableWidgetItem(str(int(cnt_item.text()) + 1)))
+                if cnt_item: self.table_rooms.setItem(row, 3, QTableWidgetItem(str(int(cnt_item.text()) + 1)))
 
-        # === 3. 写入底部表格 ===
         if msg_type not in ['discovery', 'anchor_info', 'heartbeat']:
             user = data.get('user', '')
             content = data.get('content',
                                '') if msg_type == 'chat' else f"送 {data.get('gift_name')} x{data.get('count')}"
-
             d_row = self.table_details.rowCount()
             self.table_details.insertRow(d_row)
             self.table_details.setItem(d_row, 0, QTableWidgetItem(str(room_id)))
@@ -476,15 +509,37 @@ class MainWindow(QMainWindow):
             self.table_details.setItem(d_row, 2, QTableWidgetItem("弹幕" if msg_type == 'chat' else "礼物"))
             self.table_details.setItem(d_row, 3, QTableWidgetItem(content))
             self.table_details.setItem(d_row, 4, QTableWidgetItem(datetime.datetime.now().strftime('%H:%M:%S')))
-
             if d_row > 200: self.table_details.removeRow(0)
             self.table_details.scrollToBottom()
 
     def closeEvent(self, event):
+        # 1. 恢复系统代理
+        try:
+            self.proxy_manager.unset_proxy()
+        except:
+            pass
+
+        # 2. 清理所有后台进程
         self.clear_rooms()
-        if self.worker: self.worker.stop()
+
+        # 3. 停止抓包线程
+        if self.worker:
+            self.worker.stop()
+
         event.accept()
 
+
+# === 全局防崩: 如果直接杀进程，尝试恢复代理 (尽力而为) ===
+# 注意：如果是 taskkill /F 强杀，这个可能来不及执行，所以推荐用 closeEvent
+def emergency_restore():
+    try:
+        pm = SystemProxy()
+        pm.unset_proxy()
+    except:
+        pass
+
+
+atexit.register(emergency_restore)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
