@@ -1,11 +1,17 @@
+
 import mitmproxy.http
 import dy_pb2 as dy
 import gzip
 import json
 import sys
 import time
-import brotli  # 需要 pip install brotli，如果没有也没关系，代码做了容错
 from urllib.parse import parse_qs, urlparse
+
+# 尝试导入 brotli，没有就忽略（抖音有时用br压缩）
+try:
+    import brotli
+except ImportError:
+    brotli = None
 
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -15,19 +21,28 @@ class DouyinBackend:
         self.discovered_rooms = set()
         self.last_clean_time = time.time()
 
-    # === 1. 监听 HTTP (获取精准主播信息) ===
+    # === 1. HTTP 响应：极简白名单模式 ===
     def response(self, flow: mitmproxy.http.HTTPFlow):
-        # 监听多种可能的进场接口
-        if "webcast/room/enter_room" in flow.request.url:
+        # 默认：开启流模式（Stream），让数据直接通过，不缓存，不解析
+        # 这能解决 99% 的视频卡顿问题
+        flow.response.stream = True
+
+        url = flow.request.url
+
+        # 特例：如果是“进入房间”接口，我们需要数据，所以关闭流模式，进行拦截
+        if "webcast/room/enter_room" in url:
+            flow.response.stream = False
+
             try:
-                # 智能解压：处理 gzip, br 等多种压缩格式
                 content = flow.response.content
-                if flow.response.headers.get("content-encoding") == "br":
+                # 处理压缩
+                encoding = flow.response.headers.get("content-encoding", "")
+                if encoding == "br" and brotli:
                     try:
                         content = brotli.decompress(content)
                     except:
                         pass
-                elif flow.response.headers.get("content-encoding") == "gzip":
+                elif encoding == "gzip":
                     try:
                         content = gzip.decompress(content)
                     except:
@@ -36,21 +51,17 @@ class DouyinBackend:
                 json_str = content.decode('utf-8', errors='ignore')
                 data = json.loads(json_str)
 
-                # 兼容不同的数据结构
+                # 兼容两种数据结构
                 room_data = data.get('data', {}).get('data', [])
                 if not room_data:
-                    # 有时候结构可能是 data.room
                     room_data = [data.get('data', {}).get('room', {})]
 
-                if room_data:
+                if room_data and room_data[0]:
                     room_info = room_data[0]
-                    if not room_info: return
-
                     room_id = str(room_info.get('id_str', 'UNKNOWN'))
                     owner = room_info.get('owner', {})
                     nickname = owner.get('nickname', '未知主播')
 
-                    # 提取 Short ID
                     display_id = owner.get('display_id', '')
                     short_id = owner.get('short_id', '')
                     real_id = display_id if display_id else str(short_id)
@@ -63,13 +74,14 @@ class DouyinBackend:
                         "content": "主播信息更新"
                     }
                     print(f"DY_DATA::{json.dumps(info_pack, ensure_ascii=False)}")
-            except Exception as e:
-                # print(f"DEBUG: 解析主播信息失败: {e}")
+            except:
                 pass
 
-    # === 2. 监听 WebSocket (弹幕/礼物) ===
+    # === 2. WebSocket 监听 (弹幕/礼物) ===
+    # WebSocket 不受 HTTP stream 影响，它是独立协议，这里逻辑不变
     def websocket_message(self, flow: mitmproxy.http.HTTPFlow):
         if "webcast" not in flow.request.url: return
+
         message = flow.websocket.messages[-1]
         if message.from_client: return
 
@@ -79,7 +91,6 @@ class DouyinBackend:
         except:
             room_id = "UNKNOWN"
 
-        # 发送发现信号
         if room_id != "UNKNOWN" and room_id not in self.discovered_rooms:
             discovery_pack = {"type": "discovery", "room_id": room_id, "user": "获取中...", "content": "检测到直播流"}
             print(f"DY_DATA::{json.dumps(discovery_pack, ensure_ascii=False)}")
@@ -103,8 +114,6 @@ class DouyinBackend:
 
             for msg in response.messagesList:
                 data_pack = {}
-
-                # --- 弹幕 ---
                 if msg.method == 'WebcastChatMessage':
                     try:
                         chat = dy.ChatMessage();
@@ -113,32 +122,17 @@ class DouyinBackend:
                                      "content": chat.content, "time": str(chat.common.createTime)}
                     except:
                         pass
-
-                # --- 礼物 (容错版) ---
                 elif msg.method == 'WebcastGiftMessage':
                     try:
                         gift = dy.GiftMessage();
                         gift.ParseFromString(msg.payload)
-                        # 尽力获取字段，没有就给默认值
                         g_name = "未知礼物"
                         if hasattr(gift, 'gift') and gift.gift.name: g_name = gift.gift.name
-
-                        g_user = "未知用户"
-                        if hasattr(gift, 'user') and gift.user.nickName: g_user = gift.user.nickName
-
                         count = 1
                         if hasattr(gift, 'comboCount'): count = gift.comboCount
-
-                        data_pack = {
-                            "type": "gift",
-                            "room_id": room_id,
-                            "user": g_user,
-                            "gift_name": g_name,
-                            "count": count,
-                            "time": str(gift.common.createTime)
-                        }
-                    except Exception as e:
-                        # 哪怕解析烂了，也发一个包证明收到过礼物
+                        data_pack = {"type": "gift", "room_id": room_id, "user": gift.user.nickName,
+                                     "gift_name": g_name, "count": count, "time": str(gift.common.createTime)}
+                    except:
                         data_pack = {"type": "gift", "room_id": room_id, "user": "解析错误", "gift_name": "未知",
                                      "count": 1, "time": ""}
 
@@ -147,7 +141,6 @@ class DouyinBackend:
                         print(f"DY_DATA::{json.dumps(data_pack, ensure_ascii=False)}")
                     except:
                         pass
-
         except:
             pass
 
@@ -157,5 +150,7 @@ addons = [DouyinBackend()]
 if __name__ == "__main__":
     from mitmproxy.tools.main import mitmdump
 
+    # 强制使用 8081
     params = ['-p', '8081', '-q', '-s', __file__]
     mitmdump(params)
+
