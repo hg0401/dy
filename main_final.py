@@ -1,4 +1,5 @@
 import sys
+import multiprocessing  # 1. 确保导入了这个库
 import json
 import subprocess
 import datetime
@@ -9,13 +10,13 @@ import atexit  # 退出时清理
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
                              QPushButton, QGroupBox, QCheckBox, QTextEdit, QLabel,
-                             QHeaderView, QLineEdit)
+                             QHeaderView, QLineEdit, QMessageBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 
 
 # ==========================================
-# 0. 系统代理管理器 (核心新增组件)
+# 0. 系统代理管理器
 # ==========================================
 class SystemProxy:
     INTERNET_SETTINGS = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -26,11 +27,8 @@ class SystemProxy:
         """开启系统代理"""
         try:
             proxy_addr = f"{ip}:{port}"
-            # 1. 开启代理 (ProxyEnable = 1)
             winreg.SetValueEx(self.INTERNET_SETTINGS, 'ProxyEnable', 0, winreg.REG_DWORD, 1)
-            # 2. 设置地址 (ProxyServer = 127.0.0.1:8081)
             winreg.SetValueEx(self.INTERNET_SETTINGS, 'ProxyServer', 0, winreg.REG_SZ, proxy_addr)
-            # 3. 刷新系统设置，使其立即生效
             self.refresh_system()
             print(f">>> 系统代理已自动开启: {proxy_addr}")
         except Exception as e:
@@ -39,16 +37,13 @@ class SystemProxy:
     def unset_proxy(self):
         """关闭系统代理"""
         try:
-            # 1. 关闭代理 (ProxyEnable = 0)
             winreg.SetValueEx(self.INTERNET_SETTINGS, 'ProxyEnable', 0, winreg.REG_DWORD, 0)
-            # 2. 刷新系统设置
             self.refresh_system()
-            print(">>> 系统代理已自动关闭，恢复直连")
+            print(">>> 系统代理已自动关闭")
         except Exception as e:
             print(f"❌ 关闭代理失败: {e}")
 
     def refresh_system(self):
-        """通知 Windows 设置已改变，必须执行这一步，否则注册表改了也不生效"""
         INTERNET_OPTION_SETTINGS_CHANGED = 39
         INTERNET_OPTION_REFRESH = 37
         ctypes.windll.wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
@@ -67,31 +62,74 @@ class CaptureWorker(QThread):
         self.process = None
         self.is_running = True
 
+
+
     def run(self):
-        python_exe = sys.executable
-        script_path = "addon_backend.py"
 
-        if not os.path.exists(script_path):
-            self.log_signal.emit('sys', f"❌ 错误：找不到 {script_path}")
-            return
 
+        # ---------------------------------------------------------
+        # 1. 统一构建启动命令 (解决变量爆红问题)
+        # ---------------------------------------------------------
+        cmd = []
+
+        if getattr(sys, 'frozen', False):
+            # 【模式 A：打包后的 EXE】
+            # 寻找同目录下的 backend.exe
+            base_path = os.path.dirname(sys.executable)
+            backend_exe = os.path.join(base_path, "backend.exe")
+
+            # 检查文件是否存在
+            if not os.path.exists(backend_exe):
+                self.log_signal.emit('sys', f"❌ 严重错误：找不到 {backend_exe}")
+                self.log_signal.emit('sys', "请确保 backend.exe 和主程序在同一个文件夹内！")
+                return
+
+            # 命令就是直接运行这个 exe
+            cmd = [backend_exe]
+
+        else:
+            # 【模式 B：源码调试】
+            # 寻找同目录下的 addon_backend.py
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            backend_script = os.path.join(base_path, "addon_backend.py")
+
+            if not os.path.exists(backend_script):
+                self.log_signal.emit('sys', f"❌ 错误：找不到 {backend_script}")
+                return
+
+            # 命令是 python + 脚本路径
+            cmd = [sys.executable, backend_script]
+
+        # ---------------------------------------------------------
+        # 2. 统一启动进程 (只启动一次，并挂载管道读取数据)
+        # ---------------------------------------------------------
         try:
-            # 端口固定 8081
-            cmd = [python_exe, script_path]
+            # 这里的 creationflags 用来控制是否弹黑框
+            # CREATE_NO_WINDOW = 0x08000000 (完全隐藏黑框)
+            # CREATE_NEW_CONSOLE = 0x00000010 (弹出独立黑框，方便调试)
+            # 建议：如果 backend.exe 自己有日志输出，可以用 NO_WINDOW，因为我们在下面用 stdout 读取了
+            flags = subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+            # 暂时改成这个，允许后台弹出一个黑框，让我们看到报错信息
+            # flags = subprocess.CREATE_NEW_CONSOLE
+
             self.process = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.PIPE,  # 必须有，否则读不到 DY_DATA
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding='utf-8',
                 bufsize=1,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0
+                creationflags=flags
             )
             self.log_signal.emit('sys', '>>> 抓包服务已启动 (Port: 8081)...')
+
         except Exception as e:
             self.log_signal.emit('sys', f"❌ 启动失败: {str(e)}")
             return
 
+        # ---------------------------------------------------------
+        # 3. 数据监听循环 (保持不变)
+        # ---------------------------------------------------------
         while self.is_running:
             if not self.process: break
             try:
@@ -100,19 +138,24 @@ class CaptureWorker(QThread):
 
                 if line:
                     line = line.strip()
+                    # 监听数据标识
                     if line.startswith("DY_DATA::"):
                         json_str = line.replace("DY_DATA::", "")
                         try:
+                            import json
                             data = json.loads(json_str)
                             self.data_signal.emit(data)
                         except:
                             pass
+                    # 监听报错信息
                     elif "Error" in line:
                         self.log_signal.emit('sys', f"[后端报错] {line}")
+                    # 调试用：如果想看后端所有输出，可以取消下面这行的注释
+                    # else: self.log_signal.emit('sys', f"[后端] {line}")
+
             except Exception:
                 break
-
-    def stop(self):
+    def stop0(self):
         self.is_running = False
         if self.process:
             try:
@@ -120,6 +163,27 @@ class CaptureWorker(QThread):
             except:
                 pass
 
+    def stop(self):
+        self.is_running = False
+        if self.process:
+            try:
+                # 1. 打印日志（可选）
+                print(f">>> 正在终止后台进程 PID: {self.process.pid}")
+
+                # 2. 使用 Windows 系统命令强制击杀进程树
+                # /F = 强制终止
+                # /T = 终止该进程及其所有子进程 (Tree) -> 这一步最关键！
+                # /PID = 指定进程ID
+                import subprocess
+                subprocess.call(
+                    ['taskkill', '/F', '/T', '/PID', str(self.process.pid)],
+                    stdout=subprocess.DEVNULL,  # 不显示成功信息
+                    stderr=subprocess.DEVNULL  # 不显示报错信息（比如进程已经没了）
+                )
+            except Exception as e:
+                print(f"❌ 关闭后台失败: {str(e)}")
+            finally:
+                self.process = None
 
 # ==========================================
 # 2. 自定义控件
@@ -162,7 +226,7 @@ class AnchorInfoCard(QGroupBox):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("抖音直播监控中控台 - 自动代理版")
+        self.setWindowTitle("抖音直播监控中控台 - 最终稳定版")
         self.resize(1300, 850)
 
         self.setStyleSheet("""
@@ -176,8 +240,11 @@ class MainWindow(QMainWindow):
         """)
 
         # --- 自动设置系统代理 ---
-        self.proxy_manager = SystemProxy()
-        self.proxy_manager.set_proxy("127.0.0.1", "8081")
+        try:
+            self.proxy_manager = SystemProxy()
+            self.proxy_manager.set_proxy("127.0.0.1", "8081")
+        except Exception as e:
+            print(f"代理设置异常（非致命）: {e}")
 
         self.text_log = QTextEdit()
         self.text_log.setReadOnly(True)
@@ -277,50 +344,74 @@ class MainWindow(QMainWindow):
         cb.stateChanged.connect(lambda s, k=key: self.filters.update({k: s == 2}))
         layout.addWidget(cb, r, c)
 
+    # ======================================================
+    #   核心修复区：启动浏览器
+    # ======================================================
     def open_headless_browser(self, url):
-        browser_path = None
-        candidates = [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
-        ]
-        for path in candidates:
-            if os.path.exists(path):
-                browser_path = path
-                break
-
-        if not browser_path: return None
-
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-
-        cmd = [
-            browser_path,
-            "--proxy-server=http://127.0.0.1:8081",
-            f"--user-agent={user_agent}",
-
-            # === 核心去自动化特征参数 ===
-            "--disable-blink-features=AutomationControlled",  # <--- 关键！防止被识别为机器人
-            "--exclude-switches=enable-automation",
-
-            # === 性能参数 ===
-            "--autoplay-policy=no-user-gesture-required",
-            "--disable-quic",
-            "--ignore-certificate-errors",
-            "--no-first-run",
-            "--no-sandbox",
-            "--mute-audio",
-
-            # 开启 GPU 加速 (解决卡顿)
-            "--enable-gpu-rasterization",
-            "--ignore-gpu-blocklist",
-
-            url
-        ]
-
         try:
-            return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.PIPE)
-        except:
+            # 1. 寻找浏览器
+            browser_path = None
+            candidates = [
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+            ]
+            for path in candidates:
+                if os.path.exists(path):
+                    browser_path = path
+                    break
+
+            if not browser_path:
+                self.log_signal.emit('sys', "❌ 未找到浏览器")
+                return None
+
+            # 2. 设置数据目录 (必须有这个才能获取数据)
+            # 使用 os.getcwd() 最稳妥，生成在当前运行目录下
+            current_dir = os.getcwd()
+            user_data_dir = os.path.join(current_dir, "browser_profile_live")
+            if not os.path.exists(user_data_dir):
+                try:
+                    os.makedirs(user_data_dir)
+                except:
+                    pass
+
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+            cmd = [
+                browser_path,
+                "--proxy-server=http://127.0.0.1:8081",
+                f"--user-agent={user_agent}",
+                f"--user-data-dir={user_data_dir}",  # 关键点：记忆功能
+
+                "--disable-blink-features=AutomationControlled",
+                "--exclude-switches=enable-automation",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-quic",
+                "--ignore-certificate-errors",
+                "--no-first-run",
+                "--no-sandbox",
+                "--enable-gpu-rasterization",
+                "--ignore-gpu-blocklist",
+                "--start-maximized",
+                url
+            ]
+
+            # 3. 启动进程
+            # 移除了 creationflags (因为您的环境不支持)
+            # 保留了 stdin=subprocess.PIPE (因为您测试有效)
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.PIPE
+            )
+            return proc
+
+        except Exception as e:
+            # 捕获所有启动错误，防止闪退
+            print(f"CRITICAL ERROR: {e}")
+            self.handle_log('sys', f"❌ 浏览器启动严重错误: {e}")
             return None
 
     def add_room_from_url(self):
@@ -372,26 +463,29 @@ class MainWindow(QMainWindow):
     def toggle_browser(self, btn, url):
         row = self.table_rooms.indexAt(btn.pos()).row()
         if row == -1: return
+
         if btn.text() == "启动":
             proc = self.open_headless_browser(url)
             if proc:
                 self.pending_browsers[row] = proc
-                btn.setText("关闭");
+                btn.setText("关闭")
                 btn.setStyleSheet("background-color: #d9534f;")
                 self.table_rooms.setItem(row, 6, QTableWidgetItem("运行中"))
                 self.table_rooms.item(row, 6).setForeground(QColor("green"))
         else:
-            self.kill_browser(row)
-            btn.setText("启动");
+            self.safe_kill(row)
+            btn.setText("启动")
             btn.setStyleSheet("background-color: #568668;")
             self.table_rooms.setItem(row, 6, QTableWidgetItem("已停止"))
             self.table_rooms.item(row, 6).setForeground(QColor("black"))
             self.table_rooms.setItem(row, 1, QTableWidgetItem("待连接"))
 
-    def kill_browser(self, row):
+    def safe_kill(self, row):
         if row in self.pending_browsers:
             try:
-                subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.pending_browsers[row].pid)])
+                self.pending_browsers[row].terminate()
+                subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.pending_browsers[row].pid)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except:
                 pass
             del self.pending_browsers[row]
@@ -402,7 +496,9 @@ class MainWindow(QMainWindow):
                 target_id = r_id
                 if info.get('browser_proc'):
                     try:
-                        subprocess.call(['taskkill', '/F', '/T', '/PID', str(info['browser_proc'].pid)])
+                        info['browser_proc'].terminate()
+                        subprocess.call(['taskkill', '/F', '/T', '/PID', str(info['browser_proc'].pid)],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     except:
                         pass
                 break
@@ -412,7 +508,7 @@ class MainWindow(QMainWindow):
         row = self.table_rooms.indexAt(btn.pos()).row()
         if row == -1: return
         if room_id: self.blacklisted_rooms.add(room_id)
-        self.kill_browser(row)
+        self.safe_kill(row)
         self.table_rooms.removeRow(row)
         for r_id in self.room_map:
             if self.room_map[r_id]['row'] > row: self.room_map[r_id]['row'] -= 1
@@ -448,7 +544,7 @@ class MainWindow(QMainWindow):
         if not url_item: return
         url = url_item.text()
         if "http" not in url: return
-        self.kill_browser(row)
+        self.safe_kill(row)
         proc = self.open_headless_browser(url)
         if proc:
             self.pending_browsers[row] = proc
@@ -513,24 +609,16 @@ class MainWindow(QMainWindow):
             self.table_details.scrollToBottom()
 
     def closeEvent(self, event):
-        # 1. 恢复系统代理
         try:
             self.proxy_manager.unset_proxy()
         except:
             pass
-
-        # 2. 清理所有后台进程
         self.clear_rooms()
-
-        # 3. 停止抓包线程
         if self.worker:
             self.worker.stop()
-
         event.accept()
 
 
-# === 全局防崩: 如果直接杀进程，尝试恢复代理 (尽力而为) ===
-# 注意：如果是 taskkill /F 强杀，这个可能来不及执行，所以推荐用 closeEvent
 def emergency_restore():
     try:
         pm = SystemProxy()
@@ -538,10 +626,26 @@ def emergency_restore():
     except:
         pass
 
+# 定义一个全局清理函数，专门杀 backend.exe
+def kill_backend_force():
+    # 暴力查找并杀掉所有名为 backend.exe 的进程
+    # 注意：如果你同时运行两个这个软件，可能会误伤。
+    # 但作为个人工具，这是保证后台干净的最强手段。
+    import subprocess
+    try:
+        subprocess.call(['taskkill', '/F', '/IM', 'backend.exe'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except:
+        pass
+
+# 注册到退出事件中
+
+atexit.register(kill_backend_force)
 
 atexit.register(emergency_restore)
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # 2. 【关键】加上这一行！
     app = QApplication(sys.argv)
     font = QFont("Microsoft YaHei", 9)
     app.setFont(font)

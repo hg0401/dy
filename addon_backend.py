@@ -1,13 +1,16 @@
-
-import mitmproxy.http
-import dy_pb2 as dy
-import gzip
+import asyncio
 import json
 import sys
 import time
+import gzip
+# 引入 mitmproxy 核心组件，不再使用命令行的 mitmdump
+from mitmproxy import options
+from mitmproxy.tools.dump import DumpMaster
+from mitmproxy.http import HTTPFlow
+import dy_pb2 as dy
 from urllib.parse import parse_qs, urlparse
 
-# 尝试导入 brotli，没有就忽略（抖音有时用br压缩）
+# 尝试导入 brotli
 try:
     import brotli
 except ImportError:
@@ -20,70 +23,65 @@ class DouyinBackend:
     def __init__(self):
         self.discovered_rooms = set()
         self.last_clean_time = time.time()
+        print(">>> DouyinBackend 插件已加载")
 
-    # === 1. HTTP 响应：极简白名单模式 ===
-    def response(self, flow: mitmproxy.http.HTTPFlow):
-        # 默认：开启流模式（Stream），让数据直接通过，不缓存，不解析
-        # 这能解决 99% 的视频卡顿问题
-        flow.response.stream = True
+    # === 1. HTTP 响应 ===
+    def response(self, flow: HTTPFlow):
+        # 只要不是 enter_room，其他全部 stream 直通
+        if "webcast/room/enter_room" not in flow.request.url:
+            flow.response.stream = True
+            return
 
-        url = flow.request.url
+        # 拦截进场信息
+        flow.response.stream = False
+        try:
+            content = flow.response.content
+            encoding = flow.response.headers.get("content-encoding", "")
+            if encoding == "br" and brotli:
+                try:
+                    content = brotli.decompress(content)
+                except:
+                    pass
+            elif encoding == "gzip":
+                try:
+                    content = gzip.decompress(content)
+                except:
+                    pass
 
-        # 特例：如果是“进入房间”接口，我们需要数据，所以关闭流模式，进行拦截
-        if "webcast/room/enter_room" in url:
-            flow.response.stream = False
+            json_str = content.decode('utf-8', errors='ignore')
+            data = json.loads(json_str)
 
-            try:
-                content = flow.response.content
-                # 处理压缩
-                encoding = flow.response.headers.get("content-encoding", "")
-                if encoding == "br" and brotli:
-                    try:
-                        content = brotli.decompress(content)
-                    except:
-                        pass
-                elif encoding == "gzip":
-                    try:
-                        content = gzip.decompress(content)
-                    except:
-                        pass
+            room_data = data.get('data', {}).get('data', [])
+            if not room_data:
+                room_data = [data.get('data', {}).get('room', {})]
 
-                json_str = content.decode('utf-8', errors='ignore')
-                data = json.loads(json_str)
+            if room_data and room_data[0]:
+                info = room_data[0]
+                room_id = str(info.get('id_str', 'UNKNOWN'))
+                owner = info.get('owner', {})
+                nickname = owner.get('nickname', '未知主播')
 
-                # 兼容两种数据结构
-                room_data = data.get('data', {}).get('data', [])
-                if not room_data:
-                    room_data = [data.get('data', {}).get('room', {})]
+                display_id = owner.get('display_id', '')
+                short_id = owner.get('short_id', '')
+                real_id = display_id if display_id else str(short_id)
 
-                if room_data and room_data[0]:
-                    room_info = room_data[0]
-                    room_id = str(room_info.get('id_str', 'UNKNOWN'))
-                    owner = room_info.get('owner', {})
-                    nickname = owner.get('nickname', '未知主播')
+                info_pack = {
+                    "type": "anchor_info",
+                    "room_id": room_id,
+                    "user": nickname,
+                    "douyin_id": real_id,
+                    "content": "主播信息更新"
+                }
+                print(f"DY_DATA::{json.dumps(info_pack, ensure_ascii=False)}")
+                sys.stdout.flush()  # 强制刷新缓冲区
+        except:
+            pass
 
-                    display_id = owner.get('display_id', '')
-                    short_id = owner.get('short_id', '')
-                    real_id = display_id if display_id else str(short_id)
-
-                    info_pack = {
-                        "type": "anchor_info",
-                        "room_id": room_id,
-                        "user": nickname,
-                        "douyin_id": real_id,
-                        "content": "主播信息更新"
-                    }
-                    print(f"DY_DATA::{json.dumps(info_pack, ensure_ascii=False)}")
-            except:
-                pass
-
-    # === 2. WebSocket 监听 (弹幕/礼物) ===
-    # WebSocket 不受 HTTP stream 影响，它是独立协议，这里逻辑不变
-    def websocket_message(self, flow: mitmproxy.http.HTTPFlow):
+    # === 2. WebSocket 监听 ===
+    def websocket_message(self, flow: HTTPFlow):
         if "webcast" not in flow.request.url: return
-
-        message = flow.websocket.messages[-1]
-        if message.from_client: return
+        msg = flow.websocket.messages[-1]
+        if msg.from_client: return
 
         try:
             query = parse_qs(urlparse(flow.request.url).query)
@@ -92,8 +90,9 @@ class DouyinBackend:
             room_id = "UNKNOWN"
 
         if room_id != "UNKNOWN" and room_id not in self.discovered_rooms:
-            discovery_pack = {"type": "discovery", "room_id": room_id, "user": "获取中...", "content": "检测到直播流"}
-            print(f"DY_DATA::{json.dumps(discovery_pack, ensure_ascii=False)}")
+            print(
+                f"DY_DATA::{json.dumps({'type': 'discovery', 'room_id': room_id, 'user': '获取中...'}, ensure_ascii=False)}")
+            sys.stdout.flush()
             self.discovered_rooms.add(room_id)
 
         if time.time() - self.last_clean_time > 600:
@@ -101,56 +100,77 @@ class DouyinBackend:
             self.last_clean_time = time.time()
 
         try:
-            push_frame = dy.PushFrame()
-            push_frame.ParseFromString(message.content)
-            payload = push_frame.payload
+            push = dy.PushFrame()
+            push.ParseFromString(msg.content)
+            payload = push.payload
             try:
                 payload = gzip.decompress(payload)
             except:
                 pass
 
-            response = dy.Response()
-            response.ParseFromString(payload)
+            resp = dy.Response()
+            resp.ParseFromString(payload)
 
-            for msg in response.messagesList:
-                data_pack = {}
-                if msg.method == 'WebcastChatMessage':
+            for m in resp.messagesList:
+                pack = {}
+                if m.method == 'WebcastChatMessage':
                     try:
-                        chat = dy.ChatMessage();
-                        chat.ParseFromString(msg.payload)
-                        data_pack = {"type": "chat", "room_id": room_id, "user": chat.user.nickName,
-                                     "content": chat.content, "time": str(chat.common.createTime)}
+                        c = dy.ChatMessage();
+                        c.ParseFromString(m.payload)
+                        pack = {"type": "chat", "room_id": room_id, "user": c.user.nickName, "content": c.content,
+                                "time": str(c.common.createTime)}
                     except:
                         pass
-                elif msg.method == 'WebcastGiftMessage':
+                elif m.method == 'WebcastGiftMessage':
                     try:
-                        gift = dy.GiftMessage();
-                        gift.ParseFromString(msg.payload)
-                        g_name = "未知礼物"
-                        if hasattr(gift, 'gift') and gift.gift.name: g_name = gift.gift.name
-                        count = 1
-                        if hasattr(gift, 'comboCount'): count = gift.comboCount
-                        data_pack = {"type": "gift", "room_id": room_id, "user": gift.user.nickName,
-                                     "gift_name": g_name, "count": count, "time": str(gift.common.createTime)}
+                        g = dy.GiftMessage();
+                        g.ParseFromString(m.payload)
+                        name = g.gift.name if hasattr(g, 'gift') else "未知礼物"
+                        count = g.comboCount if hasattr(g, 'comboCount') else 1
+                        pack = {"type": "gift", "room_id": room_id, "user": g.user.nickName, "gift_name": name,
+                                "count": count, "time": str(g.common.createTime)}
                     except:
-                        data_pack = {"type": "gift", "room_id": room_id, "user": "解析错误", "gift_name": "未知",
-                                     "count": 1, "time": ""}
+                        pass
 
-                if data_pack:
+                if pack:
                     try:
-                        print(f"DY_DATA::{json.dumps(data_pack, ensure_ascii=False)}")
+                        print(f"DY_DATA::{json.dumps(pack, ensure_ascii=False)}")
+                        sys.stdout.flush()
                     except:
                         pass
         except:
             pass
 
 
-addons = [DouyinBackend()]
+# === 核心修改：使用 asyncio 直接启动 DumpMaster ===
+# === 核心修改：修正参数拼写错误 ===
+async def start_proxy():
+    print(">>> 正在启动内置代理服务 (Port: 8081)...")
+
+    # 1. 创建配置
+    opts = options.Options(listen_host='127.0.0.1', listen_port=8081)
+
+    # 2. 创建 Master
+    # 注意：参数名是 with_dumper，不是 with_dump
+    master = DumpMaster(opts, with_termlog=False, with_dumper=False)
+
+    # 3. 设置选项 (必须在创建 master 之后)
+    master.options.ssl_insecure = True
+    master.options.stream_large_bodies = '1m'
+    master.options.ignore_hosts = ['^(?!.*webcast).*']
+
+    # 4. 加载插件
+    master.addons.add(DouyinBackend())
+
+    try:
+        await master.run()
+    except KeyboardInterrupt:
+        pass
+
 
 if __name__ == "__main__":
-    from mitmproxy.tools.main import mitmdump
+    # Windows下 asyncio 策略调整
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # 强制使用 8081
-    params = ['-p', '8081', '-q', '-s', __file__]
-    mitmdump(params)
-
+    asyncio.run(start_proxy())
