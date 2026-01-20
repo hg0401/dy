@@ -7,10 +7,11 @@ import os
 import winreg  # 操作注册表
 import ctypes  # 调用系统API刷新设置
 import atexit  # 退出时清理
+from activation_dialog import ActivationDialog
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QGridLayout, QTableWidget, QTableWidgetItem,
                              QPushButton, QGroupBox, QCheckBox, QTextEdit, QLabel,
-                             QHeaderView, QLineEdit, QMessageBox)
+                             QHeaderView, QLineEdit, QMessageBox, QDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QFont
 
@@ -226,6 +227,22 @@ class AnchorInfoCard(QGroupBox):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        # --- 修改后的激活检查逻辑 ---
+        # 1. 创建实例
+        activation_dialog = ActivationDialog()
+
+        # 2. 检查本地状态
+        if not activation_dialog.check_local_activation():
+            # 3. 弹出窗口
+            result = activation_dialog.exec()
+
+            # --- 关键修改：PyQt6 中 QDialog 的返回值判断方式 ---
+            # 在 PyQt6 中，Accepted 是一个枚举值，通常直接判断 result == 1 也可以，但推荐用 QDialog.DialogCode
+            if result != QDialog.DialogCode.Accepted:
+                sys.exit(0)
+            # 如果激活成功，继续执行
+
         self.setWindowTitle("抖音直播监控中控台 - 最终稳定版")
         self.resize(1300, 850)
 
