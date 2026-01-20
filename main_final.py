@@ -228,15 +228,20 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
-        # --- 检查本地激活状态 ---
-        if not ActivationDialog().check_local_activation():
-            # --- 如果本地未激活，则弹出激活窗口 ---
-            activation_win = ActivationDialog()
+        # --- 修改后的激活检查逻辑 ---
+        # 1. 创建实例
+        activation_dialog = ActivationDialog()
 
-            result = activation_win.exec()
+        # 2. 检查本地状态
+        if not activation_dialog.check_local_activation():
+            # 3. 弹出窗口
+            result = activation_dialog.exec()
 
+            # --- 关键修改：PyQt6 中 QDialog 的返回值判断方式 ---
+            # 在 PyQt6 中，Accepted 是一个枚举值，通常直接判断 result == 1 也可以，但推荐用 QDialog.DialogCode
             if result != QDialog.DialogCode.Accepted:
                 sys.exit(0)
+            # 如果激活成功，继续执行
 
         self.setWindowTitle("抖音直播监控中控台 - 最终稳定版")
         self.resize(1300, 850)

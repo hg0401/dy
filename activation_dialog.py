@@ -3,18 +3,19 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
-from PyQt5.QtWidgets import (
+# --- 修改导入为 PyQt6 ---
+from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QLineEdit, QPushButton,
     QMessageBox, QApplication
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
 
 # ================== 客户端配置 ==================
 # 请将此处的 IP 地址修改为运行 app.py 服务器电脑的实际局域网 IP 或公网 IP
 SERVER_API_URL = "http://106.15.109.138:5000/api/validate"
-
-
 # =============================================
+
 
 class VerificationWorker(QThread):
     """后台验证线程"""
@@ -75,7 +76,7 @@ class ActivationDialog(QDialog):
         super().__init__()
         self.worker = None
         self.setWindowTitle("公开数据处理工具 V1.2.0")
-        self.setFixedSize(400, 300)
+        self.setFixedSize(800, 600) # 缩小尺寸以避免潜在的布局崩溃
         self.setupUi()
 
     def setupUi(self):
@@ -85,13 +86,14 @@ class ActivationDialog(QDialog):
 
         # 图标
         icon_label = QLabel("🤖", self)
-        icon_label.setAlignment(Qt.AlignCenter)
+        # --- PyQt6: 使用 AlignmentFlag ---
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_label.setStyleSheet("font-size: 64px; font-weight: bold;")
         main_layout.addWidget(icon_label)
 
         # 标题
         title_label = QLabel("公开数据处理工具\nV1.2.0", self)
-        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_label.setStyleSheet("""
             font-weight: bold;
             font-size: 24px;
@@ -146,7 +148,7 @@ class ActivationDialog(QDialog):
             "本软件仅为工具\n用户自行承担使用过程中的所有责任",
             self
         )
-        disclaimer_label.setAlignment(Qt.AlignCenter)
+        disclaimer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         disclaimer_label.setStyleSheet("""
             font-size: 12px;
             color: gray;
@@ -179,9 +181,8 @@ class ActivationDialog(QDialog):
                 break
 
         # 解析服务器返回的 JSON
-        # result 结构: {"valid": True/False, "message": "具体信息"}
         if result.get("valid"):
-            # 激活成功：保存密钥到本地配置文件
+            # 激活成功
             try:
                 config_data = {
                     "activation_key": self.activation_input.text().strip(),
@@ -192,13 +193,11 @@ class ActivationDialog(QDialog):
                     json.dump(config_data, f, ensure_ascii=False, indent=2)
 
                 QMessageBox.information(self, "成功", result["message"])
-                self.accept()  # 关闭对话框，返回 Accepted
+                self.accept() # 关闭对话框
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"保存配置失败: {str(e)}")
         else:
-            # 激活失败：显示服务器返回的具体原因
-            # 服务器可能返回的消息包括:
-            # "激活码不存在", "激活码已失效", "激活码已过期", "次数已用完"
+            # 激活失败
             QMessageBox.warning(self, "失败", result.get("message", "未知错误"))
 
     def unbind_membership(self):
@@ -218,15 +217,14 @@ class ActivationDialog(QDialog):
     def check_local_activation(self):
         """
         检查本地激活状态
-        如果本地有配置文件，视为已激活（防止频繁请求服务器导致无法使用）
         """
         config_path = 'activation_config.json'
         return os.path.exists(config_path)
 
 
-# # --- 测试a运行 ---
-# if __name__ == '__main__':
-#     app = QApplication(sys.argv)
-#     dialog = ActivationDialog()
-#     dialog.show()
-#     sys.exit(app.exec_())
+# --- 测试运行 ---
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    dialog = ActivationDialog()
+    dialog.show()
+    sys.exit(app.exec())
